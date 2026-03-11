@@ -1,0 +1,462 @@
+---
+title: "STA 141A: Final Project Report"
+author: "Sunetra Maddipatla"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+install.packages("xgboost")
+install.packages("slider")
+install.packages("nnet")
+install.packages("ranger")
+install.packages("pROC")
+```
+
+```{r}
+
+wildfires <- read_csv("~/Desktop/wildfires_sample_100k.csv") %>% 
+  select(FIRE_YEAR, DISCOVERY_DOY, FIRE_SIZE, LATITUDE, LONGITUDE, STATE) %>%
+  mutate(STATE = as.factor(STATE))
+
+glimpse(wildfires)
+
+```
+
+```{r}
+## Setup
+suppressMessages({
+    library(dplyr)
+    library(ggplot2)
+    library(tidyverse)
+    library(slider)
+    library(pROC)
+    library(xgboost)
+    library(Matrix)
+    library(nnet)
+})
+```
+
+Temporal Patterns Convert `FIRE_YEAR` and `DISCOVERY_DOY` to `FIRE_DATE`
+
+```{r}
+fires <- wildfires %>% 
+    mutate(FIRE_DATE = as.Date(paste(FIRE_YEAR, DISCOVERY_DOY, sep = "-"), format = "%Y-%j"),
+          YEAR = year(FIRE_DATE),
+          MONTH = month(FIRE_DATE))
+fires
+```
+
+Filtering raw wildfire records to retain only "notable" fires
+
+```{r}
+notable_threshold_acres <- 300
+notable_fires <- fires %>%
+  filter(FIRE_SIZE >= notable_threshold_acres)
+notable_fire
+
+cat("Number of notable fires:", nrow(notable_fires))
+#clear deginition and justification of the notable fire cutoff
+```
+
+Spatial Patterns
+
+Space-Time Units
+
+```{r}
+#spacetime units
+# ---- Create grid IDs and month index ----
+
+notable_fires <- notable_fires %>%
+  mutate(
+    lat_bin = floor(LATITUDE),
+    lon_bin = floor(LONGITUDE),
+    ym = YEAR * 100 + MONTH   # e.g., 201507
+  )
+
+# Fire indicator at (grid, month): did any notable fire occur?
+
+grid_month_fire <- notable_fires %>%
+  group_by(lat_bin, lon_bin, ym) %>%
+  summarise(
+    n_fires = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    fire_this_month = 1
+  )
+
+head(grid_month_fire)
+
+```
+
+Construction of a panel for these patterns
+
+```{r}
+# ---- Build panel (all grid cells that appear at least once) ----
+all_grids <- grid_month_fire %>% distinct(lat_bin, lon_bin)
+
+# Generate a safe monthly sequence using actual dates
+start_date <- ymd(paste0(min(grid_month_fire$ym) %/% 100, "-", min(grid_month_fire$ym) %% 100, "-01"))
+end_date   <- ymd(paste0(max(grid_month_fire$ym) %/% 100, "-", max(grid_month_fire$ym) %% 100, "-01"))
+
+all_months <- tibble(date = seq.Date(start_date, end_date, by = "month")) %>%
+  mutate(year = year(date), month = month(date), ym = year * 100 + month) %>%
+  select(ym, year, month)
+
+panel <- crossing(all_grids, all_months) %>%
+  left_join(grid_month_fire, by = c("lat_bin", "lon_bin", "ym")) %>%
+  mutate(
+    n_fires = replace_na(n_fires, 0),
+    fire_this_month = if_else(is.na(fire_this_month), 0, fire_this_month)
+  ) %>%
+  arrange(lat_bin, lon_bin, ym)
+
+glimpse(panel)
+```
+
+Construction Of Binary Outcome Variable
+
+```{r}
+#binary otucome variable
+
+month_fires <- notable_fire %>%
+  group_by(STATE, FIRE_YEAR, FIRE_MONTH) %>%
+  summarise(
+    notable_fire_count = n(),
+    avg_fire_size = mean(FIRE_SIZE, na.rm = TRUE),
+    max_fire_size = max(FIRE_SIZE, na.rm = TRUE),
+    wildfire_occurrence = 1,
+    .groups = "drop"
+  )
+month_fires
+```
+
+```{r}
+#IFFFYYYY
+month_fires <- notable_fire %>%
+  group_by(STATE, FIRE_YEAR, FIRE_MONTH) %>%
+  summarise(
+    notable_fire_count = n(),
+    avg_fire_size = mean(FIRE_SIZE, na.rm = TRUE),
+    max_fire_size = max(FIRE_SIZE, na.rm = TRUE),
+    wildfire_occurrence = ifelse(notable_fire_count > 0, 1, 0),
+    .groups = "drop"
+  )
+```
+
+///////
+
+Prediction Target
+
+```{r}
+panel <- panel %>%
+  arrange(lat_bin, lon_bin, ym) %>%
+  group_by(lat_bin, lon_bin) %>%
+  mutate(
+    y_next = lead(fire_this_month, n = 1L)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(y_next))
+
+table(panel$y_next)
+```
+
+Baseline Predictor
+
+```{r}
+mode_state <- function(x) {
+  names(sort(table(x), decreasing = TRUE))[1]
+}
+
+grid_state <- notable_fires %>%
+  group_by(lat_bin, lon_bin) %>%
+  summarise(
+    state = mode_state(STATE),
+    .groups = "drop"
+  ) %>%
+  mutate(state = as.factor(state))
+panel <- panel %>%
+  left_join(grid_state, by = c("lat_bin","lon_bin"))
+
+panel %>% select(`state`) %>% summary
+
+```
+
+Seasonality: Cyclical month encoding
+
+```{r}
+panel <- panel %>%
+  mutate(
+    month_sin = sin(2 * pi * month / 12),
+    month_cos = cos(2 * pi * month / 12)
+  )
+
+panel %>% select('month_sin', 'month_cos') %>% head
+```
+
+Lagged fire history
+
+```{r}
+grid_fire_size <- notable_fires %>%
+  group_by(lat_bin, lon_bin, ym) %>%
+  summarise(
+    fire_size = mean(FIRE_SIZE, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+
+panel <- panel %>%
+  arrange(lat_bin, lon_bin, ym) %>%
+  group_by(lat_bin, lon_bin) %>%
+  mutate(
+    fire_lag12 = lag(n_fires, 12, default = 0),
+    fire_roll3 = lag(n_fires, 1, default = 0) +
+                 lag(n_fires, 2, default = 0) +
+                 lag(n_fires, 3, default = 0),
+    fire_roll12 = stats::filter(lag(n_fires, default = 0),
+                                rep(1, 12),
+                                sides = 1) |> as.numeric(),
+    size_roll3 = lag(fire_size, 1, default = 0) +
+                 lag(fire_size, 2, default = 0) +
+                 lag(fire_size, 3, default = 0),
+    size_roll12 = stats::filter(lag(fire_size, default = 0),
+                                rep(1, 12),
+                                sides = 1) |> as.numeric()
+  ) %>%
+  ungroup() %>%
+  mutate(
+    fire_roll12 = coalesce(fire_roll12, 0),
+    size_roll12 = coalesce(size_roll12, 0)
+  )
+
+panel %>% 
+  select("n_fires", "fire_lag12", "fire_roll3", "fire_roll12", 
+         "size_roll3", "size_roll12") %>%
+  summary
+```
+
+Dataset Summary Table
+
+```{r}
+#dataset summary table
+dataset_summary <- tibble(
+  n_rows = nrow(panel),
+  year_min = min(panel$year),
+  year_max = max(panel$year),
+  spatial_unit = "1° x 1° lat-lon grid (floor bins)",
+  temporal_unit = "monthly",
+  outcome = "y_next = 1 if any notable fire occurs in grid cell next month",
+  predictors = "lat_bin, lon_bin, state, month_cos, month_sin, year, 
+    n_fires, fire_lag12, fire_roll3, fire_roll12, 
+    size_roll3, size_roll12"
+)
+
+dataset_summary
+```
+
+## 2 Explanatory Data Analysis 
+
+EDA Plot 1: Spatial pattern
+
+```{r}
+
+eda_spatial <- panel %>%
+  group_by(lat_bin, lon_bin) %>%
+  summarise(
+    fire_rate = mean(y_next),
+    .groups = "drop"
+  )
+
+ggplot(eda_spatial, aes(x = lon_bin, y = lat_bin, fill = fire_rate)) +
+  coord_quickmap(xlim = c(-125, -65), ylim = c(25, 50)) + 
+  geom_tile() +
+  labs(
+    title = "Spatial pattern: Mean next-month notable-fire rate by grid cell",
+    x = "Longitude bin (floor)",
+    y = "Latitude bin (floor)",
+    fill = "Mean y_next"
+  )
+```
+
+## EDA Plot 2: Temporal pattern
+
+```{r}
+eda_month <- panel %>%
+  group_by(month) %>%
+  summarise(
+    mean_y_next = mean(y_next),
+    .groups = "drop"
+  )
+
+ggplot(eda_month, aes(x = month, y = mean_y_next)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(breaks = 1:12) +
+  labs(
+    title = "Seasonality: Mean probability of a notable fire in the next month",
+    x = "Month",
+    y = "Mean of y_next"
+  )
+```
+
+## 3) Modeling
+
+```{r}
+model_df <- panel %>%
+  mutate(y_next = factor(y_next, levels = c(0, 1))) %>%
+  select(y_next, lat_bin, lon_bin, state, 
+         month_cos, month_sin, year, 
+         n_fires, fire_lag12, fire_roll3, fire_roll12, size_roll3, size_roll12)
+glimpse(model_df)
+```
+
+Gradient Boosted Trees (XGBoost)
+```{r}
+library(xgboost)
+
+xg_df <- model_df %>%
+  mutate(y_next_num = factor(y_next, levels = c(0, 1)))
+
+x_mat <- model.matrix(
+  y_next_num ~ lat_bin + lon_bin + state +
+    month_cos + month_sin + year +
+    n_fires + fire_lag12 + fire_roll3 + fire_roll12 +
+    size_roll3 + size_roll12,
+  data = xg_df
+)[, -1]
+
+xg_fit <- xgboost(
+  x = x_mat,
+  y = xg_df$y_next_num,
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  nrounds = 100,
+  max_depth = 4,
+  learning_rate = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  verbosity = 0
+)
+
+xg_fit
+```
+```{r}
+library(ranger)
+
+rf_model <- ranger(
+  y_next ~ lat_bin + lon_bin + state +
+    month_cos + month_sin + year +
+    n_fires + fire_lag12 + fire_roll3 + fire_roll12 +
+    size_roll3 + size_roll12,
+  data = model_df,
+  probability = TRUE,
+  num.trees = 500
+)
+
+rf_model
+```
+
+## 4) Model Fitting and Validation
+
+```{r}
+train <- model_df %>% filter(year <= years_sorted[5])
+valid <- model_df %>% filter(year == years_sorted[6])
+
+nn_fit <- nnet(
+  feat_formula,
+  data = train,
+  size = 5,
+  decay = 0.01,
+  maxit = 200,
+  trace = FALSE
+)
+
+pred_test <- predict(nn_fit, newdata = valid, type = "raw")
+
+head(pred_test)
+colnames(pred_test)
+```
+
+
+```{r}
+years_sorted <- sort(unique(model_df$year))
+min_train_years <- 3
+
+feat_formula <- y_next ~ lat_bin + lon_bin + month_cos + month_sin + fire_roll12
+features <- c("month_cos", "month_sin", "lat_bin", "lon_bin", "fire_roll12")
+target <- "y_next"
+
+fold_results <- tibble(
+  train_end_year = years_sorted[min_train_years:(length(years_sorted) - 2)],
+  valid_year = years_sorted[(min_train_years + 1):(length(years_sorted) - 1)]
+) %>%
+  mutate(
+    auc_glm = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) {
+      train <- model_df %>% filter(year <= tr_end)
+      valid <- model_df %>% filter(year == va_year)
+      
+      fit <- glm(feat_formula, data = train, family = binomial)
+      p_hat <- predict(fit, newdata = valid, type = "response")
+      
+      as.numeric(auc(roc(valid$y_next, p_hat, quiet = TRUE)))
+    }),
+    
+    auc_nn = map2_dbl(train_end_year, valid_year, function(tr_end, va_year) {
+  
+  train <- model_df %>% filter(year <= tr_end)
+  valid <- model_df %>% filter(year == va_year)
+  
+  nn_fit <- nnet(
+    feat_formula,
+    data = train,
+    size = 5,
+    decay = 0.01,
+    maxit = 200,
+    trace = FALSE
+  )
+  
+  p_hat <- predict(nn_fit, newdata = valid, type = "raw")
+  p_hat <- as.numeric(p_hat)
+  
+  as.numeric(auc(roc(valid$y_next, p_hat, quiet = TRUE)))
+})
+
+)
+
+fold_results
+```
+
+```{r}
+fold_long <- fold_results %>%
+  pivot_longer(
+    cols = c(auc_glm, auc_nn),
+    names_to = "model",
+    values_to = "auc"
+  )
+
+ggplot(fold_long, aes(x = valid_year, y = auc, color = model)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 2) +
+  labs(
+    title = "Time-aware cross-validation diagnostic: AUC by validation year",
+    x = "Validation year",
+    y = "AUC",
+    color = "Model"
+  ) + 
+  theme_minimal()
+```
+
+```{r}
+cat('Overall, Neural Network outperforms logistic regression in AUC by ',
+    round(mean(fold_results$auc_nn) / mean(fold_results$auc_glm) * 100, 2) - 100, "%", sep = '')
+```
+
+##5) Summary
+
+```{r}
+
+```
